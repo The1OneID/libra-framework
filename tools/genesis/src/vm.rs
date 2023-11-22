@@ -6,6 +6,7 @@ use diem_gas::{
     AbstractValueSizeGasParameters, ChangeSetConfigs, NativeGasParameters,
     LATEST_GAS_FEATURE_VERSION,
 };
+use diem_logger::prelude::*;
 use diem_types::{
     chain_id::{ChainId, NamedChain},
     on_chain_config::{
@@ -27,8 +28,9 @@ use libra_types::{legacy_types::legacy_recovery::LegacyRecovery, ol_progress::OL
 
 use crate::{
     genesis_functions::{
-        genesis_migrate_community_wallet, genesis_migrate_cumu_deposits, rounding_mint,
-        set_final_supply, set_validator_baseline_reward,
+        create_make_whole_incident, genesis_migrate_community_wallet,
+        genesis_migrate_cumu_deposits, rounding_mint, set_final_supply,
+        set_validator_baseline_reward,
     },
     supply::{populate_supply_stats_from_legacy, SupplySettings},
 };
@@ -63,7 +65,7 @@ pub fn libra_genesis_default(chain: NamedChain) -> GenesisConfiguration {
 
 pub fn migration_genesis(
     validators: &[Validator],
-    recovery: Option<&[LegacyRecovery]>,
+    recovery: &mut [LegacyRecovery],
     framework: &ReleaseBundle,
     chain_id: ChainId,
     supply_settings: &SupplySettings,
@@ -89,7 +91,7 @@ pub fn migration_genesis(
 pub fn encode_genesis_change_set(
     _core_resources_key: &Ed25519PublicKey,
     validators: &[Validator],
-    recovery: Option<&[LegacyRecovery]>,
+    recovery: &mut [LegacyRecovery],
     framework: &ReleaseBundle,
     chain_id: ChainId,
     genesis_config: &GenesisConfiguration,
@@ -132,6 +134,8 @@ pub fn encode_genesis_change_set(
 
     // TODO: consolidate with set_final_supply below
     initialize_diem_coin(&mut session);
+    warn!("initialize_diem_coin");
+    println!("initialize_diem_coin");
 
     // final supply must be set after coin is initialized, but before any
     // accounts are created
@@ -139,30 +143,38 @@ pub fn encode_genesis_change_set(
 
     initialize_on_chain_governance(&mut session, genesis_config);
 
-    if let Some(r) = recovery {
-        if !r.is_empty() {
-            let mut supply = populate_supply_stats_from_legacy(r, &supply_settings.map_dd_to_slow)
+    if !recovery.is_empty() {
+        let mut supply =
+            populate_supply_stats_from_legacy(recovery, &supply_settings.map_dd_to_slow)
                 .expect("could not parse supply from legacy file");
 
-            supply
-                .set_ratios_from_settings(supply_settings)
-                .expect("could not set supply ratios from settings");
+        supply
+            .set_ratios_from_settings(supply_settings)
+            .expect("could not set supply ratios from settings");
 
-            crate::genesis_functions::genesis_migrate_all_users(&mut session, r, &supply)
-                .expect("could not migrate users");
+        crate::genesis_functions::genesis_migrate_all_users(&mut session, recovery, &supply)
+            .expect("could not migrate users");
 
-            // need to set the baseline reward based on supply settings
-            set_validator_baseline_reward(&mut session, supply.epoch_reward_base_case as u64);
+        // need to set the baseline reward based on supply settings
+        set_validator_baseline_reward(&mut session, supply.epoch_reward_base_case as u64);
 
-            // migrate community wallets
-            genesis_migrate_community_wallet(&mut session, r)
-                .expect("could not migrate community wallets");
-            // cumulative deposits (for match index) also need separate
-            // migration for CW
-            genesis_migrate_cumu_deposits(&mut session, r, supply.split_factor)
-                .expect("could not migrate cumu deposits of cw");
-        }
+        // migrate community wallets
+        genesis_migrate_community_wallet(&mut session, recovery)
+            .expect("could not migrate community wallets");
+        // cumulative deposits (for match index) also need separate
+        // migration for CW
+        genesis_migrate_cumu_deposits(&mut session, recovery)
+            .expect("could not migrate cumu deposits of cw");
+
+        create_make_whole_incident(
+            &mut session,
+            recovery,
+            supply.make_whole,
+            supply.split_factor,
+        )
+        .expect("could not create make whole credits");
     }
+
     OLProgress::complete("user migration complete");
 
     //////// 0L ////////

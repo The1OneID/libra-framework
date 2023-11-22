@@ -51,6 +51,7 @@ pub struct Supply {
     pub slow_validator_locked: f64,
     pub slow_unlocked: f64,
     pub donor_directed: f64,
+    pub make_whole: f64,
     // which will compute later
     pub split_factor: f64,
     pub escrow_pct: f64,
@@ -63,8 +64,11 @@ impl Supply {
         // NOTE IMPORTANT: the CLI receives an unscaled integer number. And it should be scaled up to the Movevm decimal precision being used: 10^6
         self.split_factor = settings.scale_supply() / self.total;
 
+        // get the coin amount of chosen future uses
         let target_future_uses = settings.target_future_uses * self.total;
+        // excluding donor directed, how many coins are remaining to fund
         let remaining_to_fund = target_future_uses - self.donor_directed;
+        // what the ratio of remaining to fund, compared to validator_slow_locked
         self.escrow_pct = remaining_to_fund / self.slow_validator_locked;
         self.epoch_reward_base_case =
             remaining_to_fund / (365 * 100 * settings.years_escrow) as f64; // one hundred validators over 7 years every day. Note: discussed elsewhere: if this is an over estimate, the capital gets returned to community by the daily excess burn.
@@ -79,36 +83,55 @@ fn inc_supply(
     dd_wallet_list: &[LegacyAddress],
 ) -> anyhow::Result<Supply> {
     // get balances
-    let amount: f64 = match &r.balance {
+    let user_total: f64 = match &r.balance {
         Some(b) => b.coin as f64,
         None => 0.0,
     };
-    acc.total += amount;
+    acc.total += user_total;
 
-    // get donor directed
+    // get loose coins in make_whole
+    if let Some(mk) = &r.make_whole {
+        let user_credits = mk.credits.iter().fold(0, |sum, e| {
+            if !e.claimed {
+                return sum + e.coins.value;
+            }
+            sum
+        }) as f64;
+
+        acc.total += user_credits;
+        acc.make_whole += user_credits;
+    }
+
+    // sum all accounts
     if dd_wallet_list.contains(&r.account.unwrap()) {
-        acc.donor_directed += amount;
+        // is this categorized as a donor voice account?
+        acc.donor_directed += user_total;
     } else if let Some(sl) = &r.slow_wallet {
-        acc.slow_total += amount;
+        // is it a slow wallet?
+        acc.slow_total += user_total;
         if sl.unlocked > 0 {
-            acc.slow_unlocked += amount;
-            if amount > sl.unlocked as f64 {
+            // safety check, the unlocked should always be lower than total balance
+            if user_total > sl.unlocked as f64 {
+                acc.slow_unlocked += sl.unlocked as f64;
                 // Note: the validator may have transferred everything out, and the unlocked may not have changed
-                let locked = amount - sl.unlocked as f64;
+                let locked = user_total - sl.unlocked as f64;
                 acc.slow_locked += locked;
                 // if this is the special case of a validator account with slow locked balance
                 if r.val_cfg.is_some() {
-                    acc.validator += amount;
+                    acc.validator += user_total;
                     acc.slow_validator_locked += locked;
                 }
+            } else {
+                // we shouldn't have more unlocked coins than the actual balance
+                acc.slow_unlocked += user_total;
             }
         }
     } else if r.cumulative_deposits.is_some() {
         // catches the cases of any dd wallets that were mapped to slow wallets
-        acc.slow_locked += amount;
-        acc.slow_total += amount;
+        acc.slow_locked += user_total;
+        acc.slow_total += user_total;
     } else {
-        acc.normal += amount;
+        acc.normal += user_total;
     }
     Ok(acc)
 }
@@ -133,6 +156,7 @@ pub fn populate_supply_stats_from_legacy(
         slow_validator_locked: 0.0,
         slow_unlocked: 0.0,
         donor_directed: 0.0,
+        make_whole: 0.0,
         split_factor: 0.0,
         escrow_pct: 0.0,
         epoch_reward_base_case: 0.0,
@@ -169,9 +193,9 @@ fn test_genesis_math() {
     let r = crate::parse_json::recovery_file_parse(p).unwrap();
 
     let settings = SupplySettings {
-        target_supply: 10_000_000_000.0,
+        target_supply: 100_000_000_000.0, // 100B
         target_future_uses: 0.70,
-        years_escrow: 10,
+        years_escrow: 7,
         map_dd_to_slow: vec![
             // FTW
             "3A6C51A0B786D644590E8A21591FA8E2"
@@ -191,30 +215,29 @@ fn test_genesis_math() {
 
     println!("before");
     let pct_normal = supply.normal / supply.total;
-
     let pct_dd = supply.donor_directed / supply.total;
-
     let pct_slow = supply.slow_total / supply.total;
-
+    let pct_mk_whole = supply.make_whole / supply.total;
     let _pct_val_locked = supply.slow_validator_locked / supply.total;
 
-    let sum_all_pct = pct_normal + pct_slow + pct_dd;
+    let sum_all_pct = pct_normal + pct_slow + pct_dd + pct_mk_whole;
     assert!(sum_all_pct == 1.0);
-    assert!(supply.total == 2397436809784621.0);
+    assert!(supply.total == 2401575768999244.0);
 
     // genesis infra escrow math
     // future uses is intended to equal 70% in this scenario.
-    dbg!("after");
+
     supply.set_ratios_from_settings(&settings).unwrap();
+    dbg!(&supply);
 
     // escrow comes out of validator locked only
     let to_escrow = supply.escrow_pct * supply.slow_validator_locked;
     let new_slow = supply.slow_total - to_escrow;
-    dbg!(&pct_normal);
-    dbg!(&pct_dd);
-    dbg!(new_slow / supply.total);
-    dbg!(to_escrow / supply.total);
+    // dbg!(&pct_normal);
+    // dbg!(&pct_dd);
+    // dbg!(new_slow / supply.total);
+    // dbg!(to_escrow / supply.total);
 
-    let sum_all = to_escrow + new_slow + supply.normal + supply.donor_directed;
+    let sum_all = to_escrow + new_slow + supply.normal + supply.donor_directed + supply.make_whole;
     assert!(supply.total == sum_all);
 }

@@ -26,7 +26,7 @@ use diem_github_client::Client;
 use libra_types::legacy_types::app_cfg::AppCfg;
 use libra_wallet::keys::VALIDATOR_FILE;
 
-use libra_config::validator_config::initialize_validator_configs;
+use libra_config::validator_config::validator_dialogue;
 
 pub const DEFAULT_GIT_BRANCH: &str = "main";
 pub const GITHUB_TOKEN_FILENAME: &str = "github_token.txt";
@@ -92,7 +92,7 @@ impl GenesisWizard {
         // check the git token is as expected, and set it.
         self.git_token_check()?;
 
-        match initialize_validator_configs(&self.data_path, Some(&self.github_username)).await {
+        match validator_dialogue(&self.data_path, Some(&self.github_username)).await {
             Ok(_) => {
                 println!("Validators' config initialized!");
             }
@@ -138,7 +138,7 @@ impl GenesisWizard {
 
         if ready {
             // Get Legacy Recovery from file
-            let legacy_recovery = if let Some(p) = legacy_recovery_path {
+            let mut legacy_recovery = if let Some(p) = legacy_recovery_path {
                 parse_json::recovery_file_parse(p)?
             } else {
                 vec![]
@@ -150,7 +150,7 @@ impl GenesisWizard {
                 self.github_token.clone(),
                 self.data_path.clone(),
                 use_local_framework,
-                Some(&legacy_recovery),
+                &mut legacy_recovery,
                 supply_settings,
                 self.chain,
                 None,
@@ -243,9 +243,16 @@ impl GenesisWizard {
                 .interact()
             {
                 Ok(true) => {
-                    gh_client.fork_genesis_repo(&self.genesis_repo_org, &self.repo_name)?;
-                    // give it a few seconds after submitting. Otherwise will get a 500 error while the repo is being created
-                    thread::sleep(Duration::from_secs(5));
+                    match gh_client.fork_genesis_repo(&self.genesis_repo_org, &self.repo_name) {
+                        Ok(r) => {
+                            println!("SUCCESS: repo fork in progress, message: {:?}", r);
+                            // give it a few seconds after submitting. Otherwise will get a 500 error while the repo is being created
+                            thread::sleep(Duration::from_secs(5));
+                        }
+                        Err(e) => {
+                            bail!("Failed to fork repo. We need to fork the genesis repo. Are you sure it's not already forked. {}", e);
+                        }
+                    };
                 }
                 _ => bail!("no forked repo on your account, we need it to continue"),
             }
